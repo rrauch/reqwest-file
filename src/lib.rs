@@ -28,10 +28,7 @@
 //! # })
 //! ```
 
-#![cfg_attr(
-    feature = "nightly",
-    feature(type_alias_impl_trait, io_error_more)
-)]
+#![cfg_attr(feature = "nightly", feature(type_alias_impl_trait, io_error_more))]
 #![forbid(unsafe_code)]
 
 use std::future::Future;
@@ -85,8 +82,9 @@ mod inner {
     pub fn send_request(
         request: &RequestBuilder,
         offset: u64,
+        size: Option<u64>,
     ) -> RequestStreamFuture {
-        let request = prepare_request(request, offset);
+        let request = prepare_request(request, offset, size);
         request.send().map(move |result| {
             result
                 .and_then(|response| response.error_for_status())
@@ -119,8 +117,9 @@ mod inner {
     pub fn send_request(
         request: &RequestBuilder,
         offset: u64,
+        size: Option<u64>,
     ) -> RequestStreamFuture {
-        let request = prepare_request(request, offset);
+        let request = prepare_request(request, offset, size);
         Box::pin(request.send().map(move |result| {
             result
                 .and_then(|response| response.error_for_status())
@@ -138,11 +137,25 @@ mod inner {
     }
 }
 
-fn prepare_request(request: &RequestBuilder, offset: u64) -> RequestBuilder {
+fn prepare_request(
+    request: &RequestBuilder,
+    offset: u64,
+    size: Option<u64>,
+) -> RequestBuilder {
+    let range = match size {
+        Some(size) if size > 0 => {
+            let end = size - 1;
+            format!("bytes={offset}-{end}")
+        }
+        _ => {
+            format!("bytes={offset}-")
+        }
+    };
+
     let request = request
         .try_clone()
         .expect("request contains streaming body");
-    request.header(reqwest::header::RANGE, format!("bytes={offset}-"))
+    request.header(reqwest::header::RANGE, range)
 }
 
 fn process_response(
@@ -475,7 +488,11 @@ impl<const FF_WINDOW: u64, const FF_BUFFER: usize>
     /// Drive the state from `State::Initial` to `State::Pending`.
     fn drive_initial(&mut self) {
         if let State::Initial = self.state {
-            let future = Box::pin(send_request(self.request, *self.position));
+            let future = Box::pin(send_request(
+                self.request,
+                *self.position,
+                *self.size_,
+            ));
             *self.state = State::Pending(future);
         }
     }
