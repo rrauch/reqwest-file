@@ -36,8 +36,8 @@ use std::io::{Error as IoError, ErrorKind, SeekFrom};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use crate::inner::{send_request, RequestStream, RequestStreamFuture};
 use bytes::Bytes;
-use futures_util::{FutureExt, Stream, StreamExt};
 use pin_project::pin_project;
 use reqwest::{RequestBuilder, StatusCode};
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
@@ -58,12 +58,65 @@ impl std::fmt::Display for HttpResponseStatusError {
 
 impl std::error::Error for HttpResponseStatusError {}
 
-// Unfortunately, `reqwest::Response::bytes_stream()` returns
-// an unnamed type. Since we need to store this type,
-// we need to be able to name it, thus requiring the TAIT here.
-type RequestStream = impl Stream<Item = Result<Bytes, IoError>>;
-type StreamData = (Option<u64>, RequestStream);
-type RequestStreamFuture = impl Future<Output = Result<StreamData, IoError>>;
+// Due to changes in TAIT handling, TAITs cannot remain unconstrained if they appear
+// in a signature. In the long run, the `#[defines]` attribute will be used to mark
+// defining methods. Until then, the current workaround is to move the TAIT declaration
+// as well as all methods that actually constrain its hidden type into its own submodule.
+// see: https://github.com/rust-lang/rust/pull/113169
+mod inner {
+    use crate::{determine_size, to_io_error, HttpResponseStatusError};
+    use bytes::Bytes;
+    use futures_util::{FutureExt, Stream, StreamExt};
+    use reqwest::{RequestBuilder, StatusCode};
+    use std::future::Future;
+    use std::io::{Error as IoError, ErrorKind};
+
+    // Unfortunately, `reqwest::Response::bytes_stream()` returns
+    // an unnamed type. Since we need to store this type,
+    // we need to be able to name it, thus requiring the TAIT here.
+    pub type RequestStream = impl Stream<Item = Result<Bytes, IoError>>;
+    pub type StreamData = (Option<u64>, RequestStream);
+    pub type RequestStreamFuture =
+        impl Future<Output = Result<StreamData, IoError>>;
+
+    /// Send a request with a `Range` header,
+    /// returning a future for the response stream.
+    pub fn send_request(
+        request: &RequestBuilder,
+        offset: u64,
+    ) -> RequestStreamFuture {
+        let request = request
+            .try_clone()
+            .expect("request contains streaming body");
+        request
+            .header(reqwest::header::RANGE, format!("bytes={offset}-"))
+            .send()
+            .map(move |result| {
+                result
+                    .and_then(|response| response.error_for_status())
+                    .map_err(to_io_error)
+                    .and_then(|response| {
+                        if response.status() == StatusCode::OK {
+                            if offset != 0 {
+                                return Err(ErrorKind::NotSeekable.into());
+                            }
+                        } else if response.status()
+                            != StatusCode::PARTIAL_CONTENT
+                        {
+                            let error =
+                                HttpResponseStatusError(response.status());
+                            return Err(to_io_error(error));
+                        }
+                        let size = determine_size(offset, &response);
+                        let stream = response
+                            .bytes_stream()
+                            .map(|result| result.map_err(to_io_error));
+
+                        Ok((size, stream))
+                    })
+            })
+    }
+}
 
 fn parse_content_length(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     headers
@@ -100,38 +153,6 @@ fn determine_size(offset: u64, response: &reqwest::Response) -> Option<u64> {
     } else {
         unreachable!()
     }
-}
-
-/// Send a request with a `Range` header,
-/// returning a future for the response stream.
-fn send_request(request: &RequestBuilder, offset: u64) -> RequestStreamFuture {
-    let request = request
-        .try_clone()
-        .expect("request contains streaming body");
-    request
-        .header(reqwest::header::RANGE, format!("bytes={offset}-"))
-        .send()
-        .map(move |result| {
-            result
-                .and_then(|response| response.error_for_status())
-                .map_err(to_io_error)
-                .and_then(|response| {
-                    if response.status() == StatusCode::OK {
-                        if offset != 0 {
-                            return Err(ErrorKind::NotSeekable.into());
-                        }
-                    } else if response.status() != StatusCode::PARTIAL_CONTENT {
-                        let error = HttpResponseStatusError(response.status());
-                        return Err(to_io_error(error));
-                    }
-                    let size = determine_size(offset, &response);
-                    let stream = response
-                        .bytes_stream()
-                        .map(|result| result.map_err(to_io_error));
-
-                    Ok((size, stream))
-                })
-        })
 }
 
 /// Try to read `delta` bytes from a stream,
