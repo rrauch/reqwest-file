@@ -28,7 +28,7 @@
 //! # })
 //! ```
 
-#![feature(type_alias_impl_trait, mixed_integer_ops, io_error_more)]
+#![feature(type_alias_impl_trait, io_error_more)]
 #![forbid(unsafe_code)]
 
 use std::future::Future;
