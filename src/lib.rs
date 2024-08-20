@@ -28,7 +28,10 @@
 //! # })
 //! ```
 
-#![feature(type_alias_impl_trait, io_error_more)]
+#![cfg_attr(
+    feature = "nightly",
+    feature(type_alias_impl_trait, io_error_more)
+)]
 #![forbid(unsafe_code)]
 
 use std::future::Future;
@@ -38,6 +41,7 @@ use std::task::{Context, Poll};
 
 use crate::inner::{send_request, RequestStream, RequestStreamFuture};
 use bytes::Bytes;
+use futures_util::{FutureExt, StreamExt};
 use pin_project::pin_project;
 use reqwest::{RequestBuilder, StatusCode};
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
@@ -63,18 +67,15 @@ impl std::error::Error for HttpResponseStatusError {}
 // defining methods. Until then, the current workaround is to move the TAIT declaration
 // as well as all methods that actually constrain its hidden type into its own submodule.
 // see: https://github.com/rust-lang/rust/pull/113169
+#[cfg(feature = "nightly")]
 mod inner {
-    use crate::{determine_size, to_io_error, HttpResponseStatusError};
-    use bytes::Bytes;
-    use futures_util::{FutureExt, Stream, StreamExt};
-    use reqwest::{RequestBuilder, StatusCode};
-    use std::future::Future;
-    use std::io::{Error as IoError, ErrorKind};
+    use super::*;
 
     // Unfortunately, `reqwest::Response::bytes_stream()` returns
     // an unnamed type. Since we need to store this type,
     // we need to be able to name it, thus requiring the TAIT here.
-    pub type RequestStream = impl Stream<Item = Result<Bytes, IoError>>;
+    pub type RequestStream =
+        impl futures_util::Stream<Item = Result<Bytes, IoError>>;
     pub type StreamData = (Option<u64>, RequestStream);
     pub type RequestStreamFuture =
         impl Future<Output = Result<StreamData, IoError>>;
@@ -85,37 +86,81 @@ mod inner {
         request: &RequestBuilder,
         offset: u64,
     ) -> RequestStreamFuture {
-        let request = request
-            .try_clone()
-            .expect("request contains streaming body");
-        request
-            .header(reqwest::header::RANGE, format!("bytes={offset}-"))
-            .send()
-            .map(move |result| {
-                result
-                    .and_then(|response| response.error_for_status())
-                    .map_err(to_io_error)
-                    .and_then(|response| {
-                        if response.status() == StatusCode::OK {
-                            if offset != 0 {
-                                return Err(ErrorKind::NotSeekable.into());
-                            }
-                        } else if response.status()
-                            != StatusCode::PARTIAL_CONTENT
-                        {
-                            let error =
-                                HttpResponseStatusError(response.status());
-                            return Err(to_io_error(error));
-                        }
-                        let size = determine_size(offset, &response);
-                        let stream = response
-                            .bytes_stream()
-                            .map(|result| result.map_err(to_io_error));
+        let request = prepare_request(request, offset);
+        request.send().map(move |result| {
+            result
+                .and_then(|response| response.error_for_status())
+                .map_err(to_io_error)
+                .and_then(|response| {
+                    let size = process_response(&response, offset)?;
+                    let stream = response
+                        .bytes_stream()
+                        .map(|result| result.map_err(to_io_error));
 
-                        Ok((size, stream))
-                    })
-            })
+                    Ok((size, stream))
+                })
+        })
     }
+}
+
+#[cfg(not(feature = "nightly"))]
+mod inner {
+    use super::*;
+    use futures_util::future::BoxFuture;
+    use futures_util::stream::BoxStream;
+
+    pub type RequestStream = BoxStream<'static, Result<Bytes, IoError>>;
+    pub type StreamData = (Option<u64>, RequestStream);
+    pub type RequestStreamFuture =
+        BoxFuture<'static, Result<StreamData, IoError>>;
+
+    /// Send a request with a `Range` header,
+    /// returning a future for the response stream.
+    pub fn send_request(
+        request: &RequestBuilder,
+        offset: u64,
+    ) -> RequestStreamFuture {
+        let request = prepare_request(request, offset);
+        Box::pin(request.send().map(move |result| {
+            result
+                .and_then(|response| response.error_for_status())
+                .map_err(to_io_error)
+                .and_then(|response| {
+                    let size = process_response(&response, offset)?;
+                    let stream = response
+                        .bytes_stream()
+                        .map(|result| result.map_err(to_io_error))
+                        .boxed();
+
+                    Ok((size, stream))
+                })
+        }))
+    }
+}
+
+fn prepare_request(request: &RequestBuilder, offset: u64) -> RequestBuilder {
+    let request = request
+        .try_clone()
+        .expect("request contains streaming body");
+    request.header(reqwest::header::RANGE, format!("bytes={offset}-"))
+}
+
+fn process_response(
+    response: &reqwest::Response,
+    offset: u64,
+) -> Result<Option<u64>, IoError> {
+    if response.status() == StatusCode::OK {
+        if offset != 0 {
+            #[cfg(feature = "nightly")]
+            return Err(ErrorKind::NotSeekable.into());
+            #[cfg(not(feature = "nightly"))]
+            return Err(ErrorKind::Unsupported.into());
+        }
+    } else if response.status() != StatusCode::PARTIAL_CONTENT {
+        let error = HttpResponseStatusError(response.status());
+        return Err(to_io_error(error));
+    }
+    Ok(determine_size(offset, response))
 }
 
 fn parse_content_length(headers: &reqwest::header::HeaderMap) -> Option<u64> {
@@ -1049,7 +1094,14 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "seek error: Kind(NotSeekable)")]
+    #[cfg_attr(
+        feature = "nightly",
+        should_panic(expected = "seek error: Kind(NotSeekable)")
+    )]
+    #[cfg_attr(
+        not(feature = "nightly"),
+        should_panic(expected = "seek error: Kind(Unsupported)")
+    )]
     async fn test_seek_no_range_support() {
         let url = start_server();
         let client = reqwest::Client::new();
