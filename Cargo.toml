@@ -15,12 +15,14 @@ keywords = ["http", "request", "async"]
 bytes = "1.1.0"
 pin-project = "1.0.10"
 futures-util = "0.3.21"
-tokio = { version = "1.16.1", default-features = false }
-tokio-util = { version = "0.7.0", default-features = false, features = ["io"] }
+tokio = { version = "1.16.1", default-features = false, optional = true }
+tokio-util = { version = "0.7.0", default-features = false, features = ["io"], optional = true }
 reqwest = { version = "0.11.9", default-features = false, features = ["stream"] }
 
 [features]
 nightly = []
+tokio_io = ["dep:tokio", "dep:tokio-util"]
+futures_io = ["futures-util/io"]
 
 [dev-dependencies]
 paste = "1.0.6"
